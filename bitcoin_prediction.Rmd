@@ -1,0 +1,1464 @@
+---
+title: "Final Project: Advanced forecasting tools"
+subtitle: "Time Series Analysis and Forecasting, Master in Big Data Analytics"
+author: "Ion Bueno Ulacia, NIA: 100364530"
+date: 'UC3M, 2022'
+output:
+  html_document: 
+    css: my-theme.css
+    theme: cerulean
+    highlight: tango
+    number_sections: no
+    toc: true
+    toc_float: true
+    toc_depth: 4
+  pdf_document:
+    # css: my-theme.css
+    # theme: cerulean
+    highlight: tango
+    number_sections: yes
+    toc: yes
+    toc_depth: 1
+editor_options:
+  chunk_output_type: console
+---
+
+
+```{r global_options, include=T, echo = F}
+knitr::opts_chunk$set(echo = T, warning=FALSE, message=FALSE)
+```
+
+```{r, echo=FALSE}
+htmltools::img(src = knitr::image_uri(file.path("uc3m.jpg")), 
+               alt = 'logo', 
+               style = 'position:absolute; top:0; right:0; padding:10px;',
+               width="600",
+               height="80")
+```
+
+Some  contents and inspiration are from the Rmarkdown files provided in class by [Javier Nogales](https://portal.uc3m.es/portal/page/portal/dpto_estadistica/home/members/francisco_javier_nogales_martin).
+
+In next cell some packages which are going to be used repeatedly are loaded.
+
+```{r libraries, message=FALSE, warning=FALSE}
+library(tidyverse) 
+library(lubridate) 
+library(tsibble) 
+library(tidymodels) 
+library(modeltime) 
+library(modeltime.ensemble) 
+library(timetk) 
+library(Quandl)
+library(urca)
+library(forecast)
+library(bigtime)
+library(modeltime.ensemble) 
+library(timetk) 
+```
+
+
+
+# 1. Data preprocessing and visualization tools
+
+
+## 1.1 Data Acquisition
+
+The data set is obtained from [Blockchain](https://data.nasdaq.com/data/BCHAIN-blockchain), which is a website that publishes data related to Bitcoin, updated daily. It is published in *Quandl*, so we can access to it by means of an API. 
+
+The goal of the project is predicting the **bitcoin market price**, employing the past values of the own time series as well as other variables. These features are selected previously, thinking that they could ease the prediction of future values. The selected predictors are:
+
+* [Bitcoin USD Exchange Trade Volume](https://data.nasdaq.com/data/BCHAIN/TRVOU-bitcoin-usd-exchange-trade-volume): the total USD value of trading volume on major bitcoin exchanges.
+* [Bitcoin Number of Transactions](https://data.nasdaq.com/data/BCHAIN/NTRAN-bitcoin-number-of-transactions): the number of daily confirmed bitcoin transactions.
+* [Bitcoin Cost Per Transaction](https://data.nasdaq.com/data/BCHAIN/CPTRA-bitcoin-cost-per-transaction): cost per transaction in dollars.
+
+The target is:
+
+* [Bitcoin Market Price](https://data.nasdaq.com/data/BCHAIN/MKPRU-bitcoin-market-price-usd): average USD market price across major bitcoin exchanges.
+
+Once we have identified the target and the variables we want to use to make the predictions, we need to look for the corresponding tokens in each time series. They will be renamed after according to the variables `names`:
+
+* `price`: Bitcoin Market Price USD.
+* `volume`: Bitcoin USD Exchange Trade Volume.
+* `trans`: Bitcoin Number of Transactions.
+* `trans_cost`: Bitcoin Cost Per Transaction.
+
+```{r}
+tokens = c("BCHAIN/MKPRU",    # Bitcoin Market Price USD
+           "BCHAIN/TRVOU",    # Bitcoin USD Exchange Trade Volume
+           "BCHAIN/NTRAN",    # Bitcoin Number of Transactions
+           "BCHAIN/CPTRA"     # Bitcoin Cost Per Transaction
+)
+
+names = c("date", "price", "volume", "trans", "trans_cost")
+```
+
+
+With the corresponding tokens, we are able to call the API and collect all the data. In this case it is employed data from **2021-01-01** to **2022-03-18**. The frequency is daily, so we have enough samples with this interval.
+
+```{r}
+Quandl.api_key("7ee5wB3N-fu3EqTcth8L") # in case you exceed the number of API requests
+data = Quandl(tokens, type="raw",
+                 start_date = "2021-01-01", 
+                 end_date = "2022-03-18")
+
+bitcoin = as_tibble(data)
+```
+
+A loop is used to iterate through the columns and rename them, in order to be more understandable.
+
+```{r}
+for (i in 1:length(names)){
+  colnames(bitcoin)[i] = names[i]
+}
+```
+
+For some function and visualization tools is required having all the columns as rows an identified with the corresponding name.
+
+```{r}
+bitcoin_by_var = pivot_longer(bitcoin, c(2:length(names)),
+                               names_to = "var",
+                               values_to = "value")
+```
+
+Finally, we are able to visualize the multiple time series.
+
+```{r}
+bitcoin_by_var %>% 
+  ggplot(aes(x = date, y = value)) +
+  geom_line() +
+  labs(title = "Daily Values",
+       x = "", y="variables") +
+  facet_grid(vars(var), scales = "free_y") +
+  theme_bw() 
+```
+
+
+## 1.2 Pre-processing
+
+Before applying any statistical or machine learning model, it is advisable to apply some preprocessing steps or check if any data transformation is required.
+
+
+### 1.2.1 Missing values
+
+First, we have to check if there is any missing value.
+
+```{r}
+bitcoin_by_var %>% 
+  summarise(na = sum(is.na(value)))
+```
+
+In this case, there are non missing values.
+
+
+### 1.2.2 ACF and PACF
+
+With the ACF and PACF plot of the variables, we are able to detect if data is stationary or any seasonal pattern.
+
+```{r}
+bitcoin_by_var %>%
+    group_by(var) %>%
+    plot_acf_diagnostics(date, value, .lags = 14)
+```
+
+As it can be seen, the target `price` does not present any seasonal pattern. However, the ACF plot reveals a high correlation between lags, although only the first and second spikes are relevant in the PACF. For this reason, a first difference in this variables could be worthy.
+
+In the variables, we can appreciate a seasonal pattern each 7 days, weekly seasonality. This may lead to applying a seasonal difference.
+
+
+### 1.2.3 STL decomposition
+
+If we look into the STL decomposition of the target `price`, we can see how most of the variance cannot be explained by the season and trend components. All the fluctuations are presented in the remainder. 
+
+```{r message=FALSE}
+plot_stl_diagnostics(bitcoin, .date_var = date, .value = price)
+```
+
+In spite of that, the season component each week is clear, so it is a point to consider in the models. 
+
+If the decomposition is compared with another variable, for example with `volume`, we can clearly see the differences.
+
+```{r message=FALSE}
+plot_stl_diagnostics(bitcoin, .date_var = date, .value = volume)
+```
+
+In this case, the remainder component does not model the variability as much as with `price`. As the seasonal pattern is also clear here, differentiation should be applied.
+
+
+### 1.2.4 Differentiation
+
+After the correlograms and the STL decomposition, differentiating some variables could be worthy for the future models, at least, having this modifications as new variables.
+
+In next cell we are going to apply the KPSS test in order to see if differentiation is required in the target.
+
+```{r}
+ts(bitcoin[,"price"]) %>% ur.kpss() %>% summary()
+```
+
+In spite of overcoming the test respect some significance levels, differentiation should be consider in the target.
+
+```{r}
+diff(ts(bitcoin[,"price"])) %>% ur.kpss() %>% summary()
+```
+
+After applying it, the margin is larger. If we compare the previous ACF and PACF plots of `price`.
+
+```{r}
+bitcoin[,"price"] %>%
+    plot_acf_diagnostics(date, price, .lags = 12)
+```
+
+And the new ones.
+
+```{r}
+as_tibble(diff(ts(bitcoin[,"price"]))) %>%
+    plot_acf_diagnostics(date, price, .lags = 12)
+```
+
+The same procedure can be applied with the variables. In this case if we compare the correlogram of `volume`.
+
+```{r}
+bitcoin[,"volume"] %>%
+    plot_acf_diagnostics(date, volume, .lags = 12)
+```
+
+With the one after applying a weekly seasonal difference.
+
+```{r}
+as_tibble(diff(ts(bitcoin[,"volume"])), lag = 7) %>%
+    plot_acf_diagnostics(date, volume, .lags = 12)
+```
+
+We can see how the weekly dependence is smoothed.
+
+Finally, these differences are applied and stored as new variables in a new tibble table:
+
+* First difference to the target `price`.
+* Weekly seasonal difference to the variables: `volume`, `trans` and `trans_cost`.
+
+```{r}
+bitcoin_processed = bitcoin %>% 
+  mutate(
+    price_diff = difference(price),
+    trans_diff = difference(trans, 7), 
+    trans_cost_diff = difference(trans_cost, 7),
+    volume_diff = difference(volume, 7))
+
+bitcoin_processed
+```
+
+
+### 1.2.5 Lagged values
+
+Another important point is if the target can be explained using lagged values of variables or from the own target. With the next function, a lagged column can be added to a given data.
+
+```{r}
+lag_transformer_grouped <- function(data, var, lag){
+    data %>%
+    tk_augment_lags(var, .lags = lag)
+}
+```
+
+In addition, it is important to remark that if we want to predict which is going to be the value of the bitcoin tomorrow, we do not have the future values of other indicators, in our case, from the used variables. For this reason, a lag of 1 day is applied in each variable, in order to be more realistic with the prediction.
+
+The new created variables are stored as before in `bitcoin_preprocessed`.
+
+```{r}
+bitcoin_processed = bitcoin_processed %>%
+  lag_transformer_grouped("trans", 1) %>% 
+  lag_transformer_grouped("trans_cost", 1) %>% 
+  lag_transformer_grouped("volume", 1)
+
+bitcoin_processed
+```
+
+
+#### 1.2.5.1 Multivariate Time-Series Model - VAR
+
+Until the moment we have not seen how the variables are related themselves. For this reason, a VAR model is going to be useful to indicate us how the variables are affected between them.
+
+```{r}
+plot_lag_matrix = function(data){
+  VAR.L1 <- sparseVAR(Y=scale(as.matrix(data[,-1])),
+                    h = 1, 
+                    selection = "cv",
+                    VARpen = "L1") 
+  LhatL1 = lagmatrix(fit=VAR.L1, returnplot=TRUE)
+}
+
+plot_lag_matrix(bitcoin)
+```
+
+Given the matrix, we are only interested in the first row, since we want to predict `price`. 
+
+* There is a 3-daily lagged effect of `trans` on `price`.
+* There is a 2-daily lagged effect of `trans_cost` on `price`.
+* Finally, the own 7-daily lagged effect of `price`.
+
+These lagged values are stored as new columns in the processed tibble data.
+
+```{r}
+bitcoin_processed = bitcoin_processed %>%
+  lag_transformer_grouped("price", 7) %>% 
+  lag_transformer_grouped("trans", 3) %>% 
+  lag_transformer_grouped("trans_cost", 2)
+
+bitcoin_processed
+```
+
+After differentiating and creating lagged columns, the new variables are going to have missing values. As there are enough data, these rows are removed, in order not to have problems with the models. 
+
+```{r}
+bitcoin_processed = bitcoin_processed %>%
+  drop_na()
+
+bitcoin_processed 
+```
+
+Only 7 rows were removed.
+
+
+## 1.3 Forecasting functions
+
+
+Next function is employed to get the forecast and prediction intervals in one split. The main arguments are:
+
+* `sp`: integer to select the split.
+* `conf`: the confidence level. It is used **95%** as default.
+
+Mention the argument `back` only is used in the visualization of the actual data. It indicates how many samples are plotted from the training set (actual data).
+
+```{r}
+forecast_results = function(model_table, sp=1, conf=0.95, back=30){
+  calibration_table = model_table %>%
+    modeltime_calibrate(testing(splits$splits[[sp]]))
+  train_idx = splits$splits[[sp]]$in_id
+  beg = train_idx[length(train_idx)] - back
+  test_idx = splits$splits[[sp]]$out_id
+  n_col = ncol(bitcoin_processed)
+  fc = calibration_table %>%
+    modeltime_forecast(actual_data = bitcoin_processed[beg:test_idx[length(test_idx)], 
+                                                       1:n_col],
+                       new_data = bitcoin_processed[test_idx, 1:n_col],
+                       conf_interval = conf)
+  out_list = list("fc"=fc, "calibration"=calibration_table)
+  return(out_list)
+}
+```
+
+Next function are used to show the forecast accuracy and plot the predicted values.
+
+```{r}
+plot_forecast_table = function(calibration_table){
+  calibration_table %>%
+    modeltime_accuracy() %>%
+    table_modeltime_accuracy(.interactive = FALSE)
+}
+
+plot_forecast = function(fc_results){
+  fc_results %>%
+    plot_modeltime_forecast(.interactive = FALSE) + 
+    labs(title = "Forecasts", y = "")
+}
+```
+
+
+## 1.4 Cross validation - Back testing
+
+The evaluation of the models is going to be carried out by cross validation, using sliding windows. Next functions are used to get the corresponding splits and plot them.
+
+```{r}
+cv_split = function(data, 
+                    initial="5 months", 
+                    assess="1 months", 
+                    skip="2 months", 
+                    cumulative=FALSE){
+  splits = data %>% 
+    time_series_cv(date_var = date, 
+                   initial = initial,
+                   assess = assess,
+                   skip = skip,
+                   cumulative = cumulative)
+  return(splits)
+}
+
+plot_cv_splits = function(splits){
+  splits %>%
+    tk_time_series_cv_plan() %>%
+    plot_time_series_cv_plan(date, price, .interactive = FALSE)
+}
+
+splits = cv_split(bitcoin_processed)
+plot_cv_splits(splits)
+```
+
+There are 5 splits. As models need to be first trained in one split, the first one is selected.
+
+```{r}
+sp = 1
+```
+
+
+### 1.4.1 Re-training functions
+
+These functions are employed to train models by cross validation, as well as plotting the process and the accuracy table. They are used in next sections.
+
+```{r}
+training_results = function(model_table, splits){
+  resample_results = model_table %>%
+    modeltime_fit_resamples(resamples = splits,
+                            control = control_resamples(verbose = TRUE)
+                            )
+  return(resample_results)
+}
+
+plot_training_cv = function(resample_results){
+  resample_results %>%
+    plot_modeltime_resamples(.summary_fn = mean, 
+                             .point_size  = 3,
+                             .interactive = FALSE
+  )
+}
+
+plot_training_table = function(resample_results){
+  resample_results %>%
+    modeltime_resample_accuracy(summary_fns = list(mean = mean)) %>%
+    table_modeltime_accuracy(.interactive = FALSE)
+}
+```
+
+
+
+
+# 2. Statistical tools
+
+This section is composed by simple models where only the target is used and dynamic regression, in which the rest of the variables are employed.
+
+
+## 2.1 Automatic forecasting using modeltime
+
+Simple models using *modeltime* are used to start. Only the target `price` is employed and can be useful as benchmarks. The **ARIMA** and **Prophet** are selected.
+
+### 2.1.1 Models definition
+
+#### 2.1.1.1 ARIMA
+
+First implementation corresponds with an auto arima. 
+
+```{r message=FALSE}
+mod_arima = 
+  arima_reg() %>%
+  set_engine("auto_arima") %>%
+  fit(price ~ date, 
+      training(splits$splits[[sp]]))
+```
+
+As it has been explained in the preprocessing steps, first and seasonal difference of `price` may be worthy. In addition, the significant first spike in the PACF is translated as $p=1$ in the arima. 
+
+Mention the seasonal MA term is included because it improves the performance taking into account the BIC.
+
+```{r message=FALSE}
+mod_arima_custom = 
+  arima_reg(
+    seasonal_period          = "auto",
+    non_seasonal_ar          = 1,
+    non_seasonal_differences = 1,
+    non_seasonal_ma          = 0,
+    seasonal_ar              = 0,
+    seasonal_differences     = 1,
+    seasonal_ma              = 1
+    ) %>%
+  set_engine("arima") %>%
+  fit(price ~ date, 
+      training(splits$splits[[sp]])) 
+```
+
+
+#### 2.1.1.2 Prophet
+
+First the default prophet model is employed.
+
+```{r message=FALSE}
+mod_prophet = 
+  prophet_reg() %>%
+  set_engine("prophet") %>%
+  fit(price ~ date, 
+      training(splits$splits[[sp]]))
+```
+
+Second, some parameters are selected in order to see if the performance can improve.
+
+```{r message=FALSE}
+mod_prophet_custom = 
+  prophet_reg(
+    growth               = "linear",
+    season               = "additive",
+    seasonality_daily    = "auto"
+  ) %>%
+  set_engine("prophet") %>%
+  fit(price ~ date, 
+      training(splits$splits[[sp]]))
+```
+
+Once the models are defined, they are stored in a `modeltime_table`.
+
+```{r}
+autoMod_table = modeltime_table(
+  mod_arima, 
+  mod_arima_custom,
+  mod_prophet, 
+  mod_prophet_custom
+) 
+
+autoMod_table
+```
+
+
+### 2.1.2 Forecasting with the automatic models
+
+First step is obtaining the forecast data and the calibration table with all the models.
+
+```{r}
+autoForecast = forecast_results(autoMod_table)
+```
+
+The calibration table in which all models are stored can be accessed as:
+
+```{r}
+autoForecast$calibration
+```
+
+The forecast values can be visualized as:
+
+```{r}
+idx = 100:110
+autoForecast$fc[idx,]
+```
+
+We are interested in:
+
+* `.value`: the value being forecasted.
+* `.conf_lo`: the lower limit of the prediction interval.
+* `.conf_hi`: the upper limit of the prediction interval.
+
+The test accuracy is shown with next function.
+
+```{r}
+plot_forecast_table(autoForecast$calibration)
+```
+
+The arima model in which the values are introduced manually obtains the best score. Finally, we can plot the forecast values for the selected split (sp=1) as well as the prediction intervals.
+
+```{r warning=FALSE}
+plot_forecast(autoForecast$fc)
+```
+
+
+### 2.1.3 Re-train automatic models
+
+Given the `modeltime_table`, the training function can be called. First, the models are trained and evaluated using all the splits.
+
+```{r message=FALSE}
+autoMod_resample_results = training_results(autoMod_table, splits)
+```
+
+We can easily plot the accuracy results in every split. 
+
+```{r warning=FALSE}
+plot_training_cv(autoMod_resample_results)
+```
+
+As it is shown, in general terms the arima models perform better in every split than prophet. The mean accuracy is plotted with next function.
+
+```{r warning=FALSE}
+plot_training_table(autoMod_resample_results)
+```
+
+As expected, the arima models overcome prophet. However, to remark that the automatic arima and the manual one perform similar, when in general the manual way provides better results and in the forecasting there was a significant difference.
+
+
+## 2.2 Automatic dynamic regression
+
+Now the variables are considered in a dynamic regression with **ARIMA**.
+
+### 2.2.1 Models definition
+
+First model employs only the original variables. Mention it is not a very realistic scenario, since as mentioned before, the future values of these predictors are not known when we want to predict the future target.
+
+```{r message=FALSE}
+dynamic_arima1 = 
+  arima_reg(
+    seasonal_period          = "auto",
+    non_seasonal_ar          = 1,
+    non_seasonal_differences = 1,
+    non_seasonal_ma          = 0,
+    seasonal_ar              = 0,
+    seasonal_differences     = 1,
+    seasonal_ma              = 1
+    ) %>%
+  set_engine("arima") %>%
+  fit(price ~ date + trans + trans_cost + volume, 
+      training(splits$splits[[sp]]))
+```
+
+In the second model the same idea is applied by employing the lagged values in the variables.
+
+```{r message=FALSE}
+dynamic_arima2 = 
+  arima_reg(
+    seasonal_period          = "auto",
+    non_seasonal_ar          = 1,
+    non_seasonal_differences = 1,
+    non_seasonal_ma          = 0,
+    seasonal_ar              = 0,
+    seasonal_differences     = 1,
+    seasonal_ma              = 1
+    ) %>%
+  set_engine("arima") %>%
+  fit(price ~ date + trans_lag1 + trans_cost_lag1 + volume_lag1, 
+      training(splits$splits[[sp]]))
+```
+
+In this case we use the lagged values given by the VAR model. Mention the one corresponding to `price` is not used since this is modeled by arima.
+
+```{r message=FALSE}
+dynamic_arima3 = 
+  arima_reg(
+    seasonal_period          = "auto",
+    non_seasonal_ar          = 1,
+    non_seasonal_differences = 1,
+    non_seasonal_ma          = 0,
+    seasonal_ar              = 0,
+    seasonal_differences     = 1,
+    seasonal_ma              = 1
+    ) %>%
+  set_engine("arima") %>%
+  fit(price ~ date + trans_lag3 + trans_cost_lag2, 
+      training(splits$splits[[sp]]))
+```
+
+This model employs the differentiated values. As before, the one corresponding to `price` is not used, since this is the role of arima.
+
+```{r message=FALSE}
+dynamic_arima4 = 
+  arima_reg(
+    seasonal_period          = "auto",
+    non_seasonal_ar          = 1,
+    non_seasonal_differences = 1,
+    non_seasonal_ma          = 0,
+    seasonal_ar              = 0,
+    seasonal_differences     = 1,
+    seasonal_ma              = 1
+    ) %>%
+  set_engine("arima") %>%
+  fit(price ~ date + trans_diff + trans_cost_diff + volume_diff, 
+      training(splits$splits[[sp]]))
+```
+
+This models employs a mixed combination of variables.
+
+```{r message=FALSE}
+dynamic_arima5 = 
+  arima_reg(
+    seasonal_period          = "auto",
+    non_seasonal_ar          = 1,
+    non_seasonal_differences = 1,
+    non_seasonal_ma          = 0,
+    seasonal_ar              = 0,
+    seasonal_differences     = 1,
+    seasonal_ma              = 1
+    ) %>%
+  set_engine("arima") %>%
+  fit(price ~ date  + volume_lag1  + trans_cost_lag2 + trans_diff,
+      training(splits$splits[[sp]]))
+```
+
+The last one considers all the available predictors.
+
+```{r message=FALSE}
+dynamic_arima6 = 
+  arima_reg(
+    seasonal_period          = "auto",
+    non_seasonal_ar          = 1,
+    non_seasonal_differences = 1,
+    non_seasonal_ma          = 0,
+    seasonal_ar              = 0,
+    seasonal_differences     = 1,
+    seasonal_ma              = 1
+    ) %>%
+  set_engine("arima") %>%
+  fit(price ~ date + trans_lag1 + trans_cost_lag1 + volume_lag1 +
+        trans_lag3 + trans_cost_lag2 +
+        trans_diff + trans_cost_diff + volume_diff,
+      training(splits$splits[[sp]]))
+```
+
+
+The evaluation process is the same as before. First step is saving all the models in a `modeltime_table`.
+
+```{r}
+dynMod_table = modeltime_table(
+  dynamic_arima1,
+  dynamic_arima2,
+  dynamic_arima3,
+  dynamic_arima4,
+  dynamic_arima5,
+  dynamic_arima6
+) 
+
+dynMod_table
+```
+
+### 2.2.2 Forecasting with the dynamic regression models
+
+As before, we can get the accuracy table with the defined functions.
+
+```{r}
+dynForecast = forecast_results(dynMod_table)
+plot_forecast_table(dynForecast$calibration)
+```
+
+The results are very similar, excluding the last models which overcomes significantly the rest. However this one considers all the variables and may overfit.
+
+```{r warning=FALSE}
+plot_forecast(dynForecast$fc)
+```
+
+Looking into the forecasting series, there are not significant differences between the models.
+
+
+### 2.2.3 Re-train dynamic regression models
+
+Using all the splits.
+
+```{r message=FALSE}
+dynMod_resample_results = training_results(dynMod_table, splits)
+plot_training_cv(dynMod_resample_results)
+```
+
+All models perform similar along all the splits. If we look into the average accuracy results.
+
+```{r}
+plot_training_table(dynMod_resample_results)
+```
+
+As expected, the best model is the one in which we provide the current values of the variables. Nevertheless, as mentioned before, that is not a realistic scenario.
+
+However, the performance obtained by the arima with the one day lagged values as variables obtains a good performance. Also mention the one which uses a mixture of lagged and differentiated variables.
+
+
+## 2.3 Comparison of the best statistical models
+
+In this part we are going to consider the statistical models which provide the best results in the forecasting, since at the end it is the most recent data and in which we are more interested. The selected models are:
+
+* The arima in which the values has been introduced manually.
+* The dynamic regression of arima and all the variables.
+
+```{r}
+staMod_table = modeltime_table(
+  mod_arima_custom,
+  dynamic_arima6
+) 
+
+staMod_table
+```
+
+
+### 2.3.1 Forecasting with the best statistical models
+
+```{r}
+staForecast = forecast_results(staMod_table)
+plot_forecast_table(staForecast$calibration)
+```
+
+As we have seen, the dynamic regression overcomes the simple arima.
+
+```{r warning=FALSE}
+plot_forecast(staForecast$fc)
+```
+
+However, the forecast and prediction intervals are similar.
+
+
+### 2.3.2 Cross validation of the best statistical models
+
+```{r message=FALSE}
+staMod_resample_results = training_results(staMod_table, splits)
+plot_training_cv(staMod_resample_results)
+```
+
+The performance of the model with regressors is better than the simple arima.
+
+```{r}
+plot_training_table(staMod_resample_results)
+```
+
+As we can see, the aggregation of variables in a dynamic regression improves the result obtained by using a simple arima model.
+
+
+
+# 3. Machine learning tools
+
+The goal is predicting the target using all the available features. With machine learning, all the time series are used as predictors, the target and the variables, to predict the future value of the response.
+
+
+## 3.1 Pre-processing
+
+Before applying machine learning models, some steps have to be carried out. In this case a recipe is creating, in which:
+
+* Some variables created by default are deleted.
+* The current values of `volume`, `trans` and `trans_cost` are removed, in order to be more realistic respect the prediction.
+* The rest of variables are normalized.
+
+```{r}
+recipe_spec = recipe(price ~ ., 
+                     training(splits$splits[[sp]])) %>%
+  step_timeseries_signature(date) %>%
+  step_rm(contains("date_")) %>%
+  step_rm("volume", "trans", "trans_cost") %>%
+  step_normalize(price_diff, trans_diff, trans_cost_diff, volume_diff, 
+                 trans_lag1, trans_cost_lag1, volume_lag1, 
+                 price_lag7, trans_lag3, trans_cost_lag2)
+
+recipe_spec %>% prep() %>% juice() %>% head()
+```
+
+
+
+## 3.2 Models definition
+
+Different models are going to be fitted and evaluated to predict the bitcoin value. The options are **elastic net**, **random forest**, **XGBoost** and the **neural network NNETAR**.
+
+In order to find the best hyper-parameters, different options are tried. Mention an automatic hyper-parameter search using cross validation, which is the optimal approach, was not possible to implement due to several errors during the process. One cause could be using several variables rather than using only the target.
+
+
+### 3.2.1 Elastic net
+
+The considered hyper-parameters are:
+
+* `penalty`: a non-negative number representing the total amount of regularization.
+* `mixture`: a number between zero and one that is the proportion of L1 regularization (lasso) in the model.
+
+The idea is to penalize models which uses a lot of variables. The first one is a pure mixture between lasso and ridge regression.
+
+```{r}
+mod_glmnet1 = 
+  linear_reg(
+    penalty = 0.1, 
+    mixture = 0.5
+    ) %>%
+  set_engine("glmnet")
+
+wflw_glmnet1 = workflow() %>%
+  add_model(mod_glmnet1) %>%
+  add_recipe(recipe_spec %>% step_rm(date)) %>%
+  fit(training(splits$splits[[sp]]))
+```
+
+Second one has a larger value of `mixture`, so the model will be similar to a lasso regression.
+
+```{r}
+mod_glmnet2 = 
+  linear_reg(
+    penalty = 0.1, 
+    mixture = 0.9
+    ) %>%
+  set_engine("glmnet")
+
+wflw_glmnet2 = workflow() %>%
+  add_model(mod_glmnet2) %>%
+  add_recipe(recipe_spec %>% step_rm(date)) %>%
+  fit(training(splits$splits[[sp]]))
+```
+
+In contrast, the third one is close to a ridge regression.
+
+```{r}
+mod_glmnet3 = 
+  linear_reg(
+    penalty = 0.1, 
+    mixture = 0.1
+    ) %>%
+  set_engine("glmnet")
+
+wflw_glmnet3 = workflow() %>%
+  add_model(mod_glmnet3) %>%
+  add_recipe(recipe_spec %>% step_rm(date)) %>%
+  fit(training(splits$splits[[sp]]))
+```
+
+As with the statistical models, they are stored in a `modeltime_table`.
+
+```{r}
+glmnetMod_table = modeltime_table(
+  wflw_glmnet1,
+  wflw_glmnet2,
+  wflw_glmnet3
+) 
+glmnetMod_table
+```
+
+
+#### 3.2.1.1 Forecasting with the elastic net models
+
+```{r}
+glmnetForecast = forecast_results(glmnetMod_table)
+plot_forecast_table(glmnetForecast$calibration)
+```
+
+The performance is almost the same in the three models.
+
+```{r warning=FALSE}
+plot_forecast(dynForecast$fc)
+```
+
+As expected, the predictions are similar.
+
+
+#### 3.2.1.2 Re-train of the elastic net models
+
+The evaluation of the models is carried out as before. The goal is finding the best model according to the selected hyper-parameters.
+
+```{r message=FALSE}
+glmnetMod_resample_results = training_results(glmnetMod_table, splits)
+plot_training_cv(glmnetMod_resample_results)
+```
+
+As in the forecasting, the resample performance is almost equal.
+
+```{r}
+plot_training_table(glmnetMod_resample_results)
+```
+
+As expected, the three models obtain very close results.
+
+
+### 3.2.2 Random forest
+
+In this case, the selected hyper-parameters are:
+
+* `mtry`: an integer for the number of predictors that will be randomly sampled at each split when creating the tree models.
+* `trees`: an integer for the number of trees contained in the ensemble.
+* `min_n`: an integer for the minimum number of data points in a node that are required for the node to be split further.
+
+In order to get reproducible results, the seed is fixed, since this model introduces randomness.
+
+We start with a low value for the number of trees.
+
+```{r}
+set.seed(123)
+mod_rf1 = 
+  rand_forest(
+    mtry = 5,
+    trees = 50,
+    min_n = 5,
+    ) %>%
+  set_engine("randomForest")
+
+wflw_rf1 = workflow() %>%
+  add_model(mod_rf1) %>%
+  add_recipe(recipe_spec %>% step_rm(date)) %>%
+  fit(training(splits$splits[[sp]]))
+```
+
+The number of trees is increased.
+
+```{r}
+set.seed(123)
+mod_rf2 = 
+  rand_forest(
+    mtry = 5,
+    trees = 100,
+    min_n = 5,
+    ) %>%
+  set_engine("randomForest")
+
+wflw_rf2 = workflow() %>%
+  add_model(mod_rf2) %>%
+  add_recipe(recipe_spec %>% step_rm(date)) %>%
+  fit(training(splits$splits[[sp]]))
+```
+
+`trees` increases again.
+
+```{r}
+set.seed(123)
+mod_rf3 = 
+  rand_forest(
+    mtry = 5,
+    trees = 200,
+    min_n = 5,
+    ) %>%
+  set_engine("randomForest")
+
+wflw_rf3 = workflow() %>%
+  add_model(mod_rf3) %>%
+  add_recipe(recipe_spec %>% step_rm(date)) %>%
+  fit(training(splits$splits[[sp]]))
+```
+
+Store them in the model table.
+
+```{r}
+rfMod_table = modeltime_table(
+  wflw_rf1,
+  wflw_rf2,
+  wflw_rf3
+) 
+rfMod_table
+```
+
+
+#### 3.2.2.1 Forecasting with the random forest models
+
+```{r}
+rfForecast = forecast_results(rfMod_table)
+plot_forecast_table(rfForecast$calibration)
+```
+
+Again, the models behave similar.
+
+```{r warning=FALSE}
+plot_forecast(rfForecast$fc)
+```
+
+And the predictions are very close.
+
+
+#### 3.2.2.2 Re-train of the random forest models
+
+The evaluation procedure as usual, training using all the splits.
+
+```{r message=FALSE}
+rfMod_resample_results = training_results(rfMod_table, splits)
+plot_training_cv(rfMod_resample_results)
+```
+
+The models perform very similar.
+
+```{r}
+plot_training_table(rfMod_resample_results)
+```
+
+As it can be seen, the number of trees is not very relevant, since changing this feature does not lead to a significant change in the performance.
+
+
+### 3.2.3 XGBoost
+
+The employed hyper-parameters are:
+
+* `trees`: as before, an integer for the number of trees contained in the ensemble.
+* `min_n`: as before, an integer for the minimum number of data points in a node that is required for the node to be split further.
+* `tree_depth`: an integer for the maximum depth of the tree.
+
+```{r}
+mod_xgboost1 = 
+  boost_tree(
+    trees = 50,
+    min_n = 20,
+    tree_depth = 6
+  ) %>%
+  set_engine("xgboost")
+
+wflw_xgboost1 = workflow() %>%
+  add_model(mod_xgboost1) %>%
+  add_recipe(recipe_spec %>% step_rm(date)) %>%
+  fit(training(splits$splits[[sp]]))
+```
+
+The `min_n` is decreased while the `tree_depth` increases.
+
+```{r}
+mod_xgboost2 = 
+  boost_tree(
+    trees = 50,
+    min_n = 10,
+    tree_depth = 7
+  ) %>%
+  set_engine("xgboost")
+
+wflw_xgboost2 = workflow() %>%
+  add_model(mod_xgboost2) %>%
+  add_recipe(recipe_spec %>% step_rm(date)) %>%
+  fit(training(splits$splits[[sp]]))
+```
+
+Same step is applied again.
+
+```{r}
+mod_xgboost3 = 
+  boost_tree(
+    trees = 50,
+    min_n = 5,
+    tree_depth = 8
+  ) %>%
+  set_engine("xgboost")
+
+wflw_xgboost3 = workflow() %>%
+  add_model(mod_xgboost3) %>%
+  add_recipe(recipe_spec %>% step_rm(date)) %>%
+  fit(training(splits$splits[[sp]]))
+```
+
+Store models in the table.
+
+```{r}
+xgMod_table = modeltime_table(
+  wflw_xgboost1,
+  wflw_xgboost2,
+  wflw_xgboost3
+) 
+xgMod_table
+```
+
+
+#### 3.2.3.1 Forecasting with the XGBoost models
+
+```{r}
+xgForecast = forecast_results(xgMod_table)
+plot_forecast_table(xgForecast$calibration)
+```
+
+The first models overcomes the other two.
+
+```{r warning=FALSE}
+plot_forecast(xgForecast$fc)
+```
+
+In the forecast plot we can see how the red model is closer to the actual data.
+
+
+#### 3.2.3.2 Re-train of the XGBoost models
+
+Training and evaluation process.
+
+```{r message=FALSE}
+xgMod_resample_results = training_results(xgMod_table, splits)
+plot_training_cv(xgMod_resample_results)
+```
+
+The performance of the third model overcomes the other two in most of the splits and metrics.
+
+```{r}
+plot_training_table(xgMod_resample_results)
+```
+
+As expected, the best result is obtained by the third model. In this case `min_n` and `tree_depth` have a clear impact in the performance. 
+
+Mention the difference between the initial forecasting and the posterior re-training, now the best model is the third one and the worst the first, just the other way round.
+
+
+
+### 3.2.4 Neural network - NNETAR
+
+A neural network is the most complex model employed in this work. The selected hyper-parameters are:
+
+* `non_seasonal_ar`: the order of the non-seasonal auto-regressive (AR) terms. In this case we selected the same value as in the arima models.
+* `seasonal_ar`: the order of the seasonal auto-regressive (SAR) terms. The same value as in the arima models.
+* `hidden_units`: an integer for the number of units in the hidden model.
+* `penalty`: a non-negative numeric value for the amount of weight decay.
+* `epochs`: an integer for the number of training iterations.
+
+Mention the initialization of the weights in the neural network is random, changing the performance in every execution. That is why the seed is fixed again here.
+
+```{r message=FALSE}
+set.seed(123)
+mod_nnetar1 = 
+  nnetar_reg(
+    non_seasonal_ar = 1,
+    seasonal_ar = 0,
+    hidden_units = 10,
+    penalty = 0.1,
+    epochs = 10,
+    ) %>%
+  set_engine("nnetar")
+
+wflw_nnetar1 = workflow() %>%
+  add_model(mod_nnetar1) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(splits$splits[[sp]]))
+```
+
+The number of hidden units is increased. In order to avoid overfitting, the `penalty` is increased and the number of `epochs` reduced.
+
+```{r message=FALSE}
+set.seed(123)
+mod_nnetar2 = 
+  nnetar_reg(
+    seasonal_period = "auto",
+    non_seasonal_ar = 1,
+    seasonal_ar = 0,
+    hidden_units = 20,
+    penalty = 0.2,
+    epochs = 5,
+    ) %>%
+  set_engine("nnetar")
+
+wflw_nnetar2 = workflow() %>%
+  add_model(mod_nnetar2) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(splits$splits[[sp]]))
+```
+
+The number of epochs is reduced again.
+
+```{r message=FALSE}
+set.seed(123)
+mod_nnetar3 = 
+  nnetar_reg(
+    seasonal_period = "auto",
+    non_seasonal_ar = 1,
+    seasonal_ar = 0,
+    hidden_units = 25,
+    penalty = 0.2,
+    epochs = 3,
+    ) %>%
+  set_engine("nnetar")
+
+wflw_nnetar3 = workflow() %>%
+  add_model(mod_nnetar3) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(splits$splits[[sp]]))
+```
+
+The three networks are stored.
+
+```{r}
+set.seed(123)
+nnMod_table = modeltime_table(
+  wflw_nnetar1,
+  wflw_nnetar2,
+  wflw_nnetar3
+) 
+nnMod_table
+```
+
+
+#### 3.2.4.1 Forecasting with the NNETAR models
+
+```{r}
+nnForecast = forecast_results(nnMod_table)
+plot_forecast_table(nnForecast$calibration)
+```
+
+The first network is more accurate. Mention it is the simplest one in terms of parameters.
+
+```{r warning=FALSE}
+plot_forecast(nnForecast$fc)
+```
+
+As expected, the red forecast is closer to the actual data.
+
+
+#### 3.2.4.2 Re-train of the NNETAR models
+
+Perform cross validation. 
+
+```{r message=FALSE}
+nnMod_resample_results = training_results(nnMod_table, splits)
+plot_training_cv(nnMod_resample_results)
+```
+
+The first model overcomes the other two in most of splits and metrics.
+
+```{r}
+plot_training_table(nnMod_resample_results)
+```
+
+The simplest neural network obtains the best performance.
+
+It is important to remark that selecting the hyper-parameters in a neural network is a complex and time consuming process. The number of parameters increases a lot with larger values in the hyper-parameters, having the risk of overfitting. So it is a good practice taking care of obtaining a too complex network. 
+
+
+## 3.3 Comparison of the best machine learning models
+
+Finally the best machine learning models are selected to predict the value of the target.
+
+```{r}
+mlMod_table = modeltime_table(
+  wflw_glmnet3,
+  wflw_rf2,
+  wflw_xgboost1,
+  wflw_nnetar1
+) 
+mlMod_table
+```
+
+
+### 3.3.1 Forecasting with the best machine learning models
+
+```{r}
+mlForecast = forecast_results(mlMod_table)
+plot_forecast_table(mlForecast$calibration)
+```
+
+The best model corresponds with the neural network, followed by the elastic net.
+
+```{r warning=FALSE}
+plot_forecast(mlForecast$fc)
+```
+
+As it can be seen, the NNETAR model fits very well the data as well as the elastic net. Nevertheless, all models make good predictions with narrow prediction intervals.
+
+
+### 3.3.2 Cross validation of the best machine learning models
+
+The cross validation process is repeated again.
+
+```{r message=FALSE}
+ml_resample_results = training_results(mlMod_table, splits)
+plot_training_cv(ml_resample_results)
+```
+
+The elastic net is the best in most of the splits and metrics. Mention the behavior of the neural network is very irregular, in some splits it is very accurate while in others the error is large.
+
+```{r}
+plot_training_table(ml_resample_results)
+```
+
+As expected, the best result is obtained by the elastic net, whereas the most complex model, the NNETAR network, has decreased its score averaging with all the splits. 
+
+The machine learning models got better forecasting results and cross validation performance than the statistical models.
+
+
+
+## 3.4 Ensembles
+
+As a last point, it is interesting to see if the performance obtained by NNETAR model can be improved by means of ensembles.
+
+If we look again into the forecast table, the second and third best models are the elastic net and the XGBoost respectively.
+
+```{r}
+plot_forecast_table(mlForecast$calibration)
+```
+
+
+### 3.4.1 Elastic net and XGBoost
+
+First ensemble is a combination of these two.
+
+```{r}
+idx1 = c(1, 3) # selection of models
+
+mod_ensemble1 = mlForecast$calibration[idx1,] %>%
+  ensemble_average(type = "mean")
+
+mod_ensemble1
+```
+
+The forecasting process is the same as before.
+
+```{r message=FALSE}
+forecast_ens1 = forecast_results(mod_ensemble1)
+plot_forecast_table(forecast_ens1$calibration)
+```
+
+However, the ensemble does not improve NNETAR performance.
+
+```{r warning=FALSE}
+plot_forecast(forecast_ens1$fc)
+```
+
+Nevertheless, the fit seems to be appropriate for the data and could be used if we want to use a faster and lighter model.
+
+
+ 
+### 3.4.2 Elastic net and NNETAR
+
+Now the ensemble is the combination of the elastic net model and the neural network.
+
+```{r}
+set.seed(123)
+idx2 = c(1, 4) # selection of models
+
+mod_ensemble2 = mlForecast$calibration[idx2,] %>%
+  ensemble_average(type = "mean")
+
+mod_ensemble2
+```
+
+The accuracy results.
+
+```{r message=FALSE}
+forecast_ens2 = forecast_results(mod_ensemble2)
+plot_forecast_table(forecast_ens2$calibration)
+```
+
+In this case, the ensemble got almost the same accuracy than the single neural network.
+
+```{r warning=FALSE}
+plot_forecast(forecast_ens2$fc)
+```
+
+
+### 3.4.3 XGBoost net and NNETAR
+
+Finally, the last ensemble is composed by the XGBoost and the neural network.
+
+```{r}
+set.seed(123)
+idx3 = c(3, 4) # selection of models
+
+mod_ensemble3 = mlForecast$calibration[idx3,] %>%
+  ensemble_average(type = "mean")
+
+mod_ensemble3
+```
+
+
+```{r message=FALSE}
+forecast_ens3 = forecast_results(mod_ensemble3)
+plot_forecast_table(forecast_ens3$calibration)
+```
+
+Surprisingly, this ensemble overcomes the previous one composed by the two best models and gets a better result than the single neural network.
+
+```{r warning=FALSE}
+plot_forecast(forecast_ens3$fc)
+```
+
+As it can be seen, the model fits very well the data and the prediction intervals are very narrow.
+
+
+# 4. Interpretation and conclusions
+
+After the whole analysis, several conclusions can be taken out respect the data set and the models employed. 
+
+At first point, how the evaluation of the models influences a lot the decision. As we have seen, training and testing in one split provides us a performance to clearly determine which is the optimal model. However, in the moment when the cross validation is applied and the models are evaluated in the whole set of splits the decision is more difficult.
+
+This behavior is the expected and that is why we apply cross validation in time series. As we are providing more data to the model, one could behave better or worse than previously. In this point, the decision should be carried out according to previous experiences or in what we are interested, thinking in how much data should be used to train.
+
+The neural network NNETAR as well as the ensemble composed by this one and the XGBoost model, obtain the best results in the test set of the first split and the forecasting is very accurate. However, if we re-train the models with all splits, we have seen how the simpler elastic net model obtains a better score. In this point is when we should consider which model we want to use and it it is worthy to use more data or only the recent one.
+
+Consulting to an expert in the topic would be the optimal approach, trying to know if old fluctuations or any past seasonality may affect the future forecast and choose a model which performs better as average, rather than in the most recent data. In the case of bitcoin's price, where market is being updated constantly, the daily frequency may be even too slow and data collected months ago very old. For this reason, the best approach may be using the models which behaves better in the most recent data, in our case, the ensemble composed by the NNETAR and the XGBoost.
+
+```{r warning=FALSE}
+final_forecast = forecast_results(mod_ensemble3, back=150)
+plot_forecast(final_forecast$fc)
+```
+
+At second point, how the variables are related with the response. If we look again into the time series plots.
+
+```{r}
+bitcoin_by_var %>% 
+  ggplot(aes(x = date, y = value)) +
+  geom_line() +
+  labs(title = "Daily Values",
+       x = "", y="variables") +
+  facet_grid(vars(var), scales = "free_y") +
+  theme_bw() 
+```
+
+At first instance the variables `trans` and `trans_cost` may have a high correlation with the response `price`, since the trend is similar. In the case of `volume` the similarity is not very clear. This could be related with the result obtained in the VAR model, in which only these two variables have lagged effects into the target.
+
+Mention also the weekly seasonality, since the VAR model returns a 7 day lagged effect from `price`, and we have seen in the correlograms and the STL decomposition that the variables have a weekly seasonal pattern.
+
+In addition to that, the inclusion of variables have improved the performance of the simple arima model and the dynamic regression with more predictors provides the best performance. For this reason, these features are being util for the prediction.
+
+
+
+
+
+
+
+
+
